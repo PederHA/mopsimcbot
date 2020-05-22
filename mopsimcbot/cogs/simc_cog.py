@@ -154,7 +154,6 @@ class SimcCog(commands.Cog):
             delete_after=10)
 
         await self.queue.put(SimulationRequest(ctx,
-                                               msg,
                                                character, 
                                                scaling=scaling, 
                                                simc_path=self.simc_path,
