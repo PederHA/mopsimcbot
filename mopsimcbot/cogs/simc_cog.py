@@ -3,7 +3,7 @@ import subprocess
 from pathlib import Path
 from functools import partial
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Union, Optional
 
 import discord
 from discord.ext import commands, tasks
@@ -20,10 +20,43 @@ MAX_ITERATIONS = 20000
 MIN_THREADS = 1
 MAX_THREADS = 4
 
+
+ParamType = Union[str, int]
+
+
+@dataclass
+class Parameter:
+    parameter: str
+    value: ParamType
+    v_min: Optional[int] = None
+    v_max: Optional[int] = None
+
+    def set_value(self, value: ParamType) -> None:
+        if type(value) != type(self.value):
+            raise TypeError(f"Type mismatch. Parameter value must be type: {type(self.value)}")
+        
+        if isinstance(value, str):
+            self.value = value
+        elif isinstance(value, int):
+            if (self.v_min is not None and value < self.v_min):
+                raise ValueError(f"{self.parameter} value must be at least {self.v_min}.")
+            elif (self.v_max is not None and value > self.v_max):
+                raise ValueError(f"{self.parameter} value cannot exceed {self.v_min}.")
+            self.value = value
+        else:
+            raise TypeError(
+                f"Invalid value type. Must be one of "
+                f"{Parameter.__annotations__['value'].__args__}"
+            )
+
+    def __str__(self) -> str:
+        return f"{self.parameter}={self.value}"
+
+
 PARAMS = {
-    "html": "out.html",
-    "threads": 1,
-    "iterations": 5000
+    "html": Parameter("html", "out.html"),
+    "threads": Parameter("threads", 1, v_min=1, v_max=4),
+    "iterations": Parameter("iterations", 5000, v_min=500, v_max=20000),
 }
 
 
@@ -38,7 +71,7 @@ class SimulationRequest:
     def __post_init__(self) -> None:
         self.event: asyncio.Event = asyncio.Event() # NOTE: remove?
         self.author_name: str = self.ctx.message.author.name # unused
-        self.filename: str = sanitize_filename(unidecode(self.author_name))
+        self.filename: str = sanitize_filename(unidecode(self.get_character_name()))
         self.profile_path: Path = Path(f"profiles/{self.filename}.simc")
     
     def get_character_name(self) -> str:
@@ -47,10 +80,10 @@ class SimulationRequest:
             if any(line.startswith(c) for c in CLASSES):
                 return line.split("=")[1].capitalize()
         else:
-            return self.author_name # fall back on author name (lazy)
+            return self.author_name # fall back on author name (should raise exception)
   
     def _get_params(self) -> str:
-        return "\n".join(f"{k}={v}" for k, v in PARAMS.items())
+        return "\n".join(str(p) for p in PARAMS.values())
 
     def make_simc_profile(self) -> None:
         # Get 'k=v' string of base parameters
@@ -67,7 +100,7 @@ class SimulationRequest:
             f.write(self.character)
 
     async def do_sim(self) -> None:
-        self.event.set()
+        self.event.set() # Improper use of asyncio.Event. Should just do away with it.
         try:
             self.make_simc_profile()
             to_run = partial(
@@ -94,9 +127,11 @@ class SimulationRequest:
         else:
             channel = self.ctx.message.channel
         
-        # NOTE: does not support overriding out= in baseprofile.simc yet
-        await channel.send(file=discord.File(fp=PARAMS["html"], 
-                                                filename=f"{self.filename}.html")) 
+        await channel.send(
+            f"Your simulation results are ready, {self.ctx.message.author.mention}.",
+            file=discord.File(fp=PARAMS["html"].value, 
+                              filename=f"{self.filename}.html")
+        ) 
 
 
 class SimcCog(commands.Cog):
@@ -113,7 +148,11 @@ class SimcCog(commands.Cog):
         self.queue_loop.start()
         
         self.send_as_dm = False
-
+    
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        print("Bot logged in")
+    
     @tasks.loop(seconds=2)
     async def queue_loop(self) -> None:
         while not self.queue.empty():
@@ -149,15 +188,17 @@ class SimcCog(commands.Cog):
         if character.startswith("http"):
             return await ctx.send("Character armory url is not supported (yet)!")
         
-        msg = await ctx.send(
-            f"Added your character to the queue, **{ctx.message.author.name}**", 
+        request = SimulationRequest(ctx,
+                                    character, 
+                                    scaling=scaling, 
+                                    simc_path=self.simc_path,
+                                    dm=self.send_as_dm)
+
+        await ctx.send(
+            f"Added **`{request.get_character_name()}`** to the queue.", 
             delete_after=10)
 
-        await self.queue.put(SimulationRequest(ctx,
-                                               character, 
-                                               scaling=scaling, 
-                                               simc_path=self.simc_path,
-                                               dm=self.send_as_dm))
+        await self.queue.put(request)
 
     @commands.command(name="queue")
     async def show_queue(self, ctx: commands.Context) -> None:
@@ -172,47 +213,42 @@ class SimcCog(commands.Cog):
             out.append("\nQueued:\n")
             for i, request in enumerate(self.queue._queue, start=1):
                 out.append(f"{i}. {request.get_character_name()}")
-        
+   
         out.append("```") 
         await ctx.send("\n".join(out))
 
     @commands.command(name="iterations")
     async def setget_iterations(self, ctx: commands.Context, iterations: int=None) -> None:
         if not iterations:
-            return await ctx.send(f"Currently set to {PARAMS['iterations']} iterations.")
-        
-        if iterations < MIN_ITERATIONS:
-            return await ctx.send(f"Number of iterations must be >={MIN_ITERATIONS}!")
-        elif iterations > MAX_ITERATIONS:
-            return await ctx.send(f"Number of iterations must be <={MAX_ITERATIONS}!")
-        else:
-            PARAMS["iterations"] = iterations
-            await ctx.send(f"Number of iterations set to {iterations}.")
+            return await ctx.send(f"Currently set to {PARAMS['iterations'].value} iterations.")
+        await self._set_param(ctx, "iterations", iterations)
 
     @commands.command(name="threads")
     @admins_only()
     async def setget_threads(self, ctx: commands.Context, threads: int=None) -> None:
         if not threads:
-            return await ctx.send(f"Currently set to {PARAMS['threads']} threads.")
-        
-        if threads < MIN_THREADS:
-            await ctx.send(f"Number of threads must be >={MIN_THREADS}!")
-        elif threads > MAX_THREADS:
-            await ctx.send(f"Number of threads must be <={MAX_THREADS}!")
-        else:
-            PARAMS["threads"] = threads
-            await ctx.send(f"Number of threads set to {threads}.")
+            return await ctx.send(f"Currently set to {PARAMS['threads'].value} threads.")
+        await self._set_param(ctx, "threads", threads)
 
-    # TODO make "class Param" with min, max, etc. to avoid these (almost) duplicate methods
+    async def _set_param(self, ctx: commands.Context, param: str, value: ParamType) -> None:
+        if param not in PARAMS:
+            raise KeyError(f"No parameter named '{param}'!")  
+        try:
+            PARAMS[param].set_value(value)
+        except Exception as e:
+            return await ctx.send("\n".join(e.args))
+        else:
+            await ctx.send(f"`{param.capitalize()}` set to {value}.")
+       
     @commands.command(name="settings")
     async def show_settings(self, ctx: commands.Context) -> None:
         skip = ["html"]
         
         out = ["```"]
-        for k, v in PARAMS.items():
-            if any(k == s for s in skip):
+        for p in PARAMS.values():
+            if any(p.parameter == s for s in skip):
                 continue
-            out.append(f"{k.capitalize()}: {v}")
+            out.append(f"{p.parameter.capitalize()}: {p.value}")
         out.append("```")
         await ctx.send("\n".join(out))
 
@@ -222,7 +258,7 @@ class SimcCog(commands.Cog):
         if not addon.exists():
             return await ctx.send(
                 "Unable to send simc addon.\n"
-                "Ask bot host to add it under 'files/simulationcraft.zip'"
+                "Ask bot owner to add it under 'files/simulationcraft.zip'"
             )
 
         await ctx.send(file=discord.File(addon))
